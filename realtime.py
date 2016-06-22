@@ -1,6 +1,8 @@
 from __future__ import division
 import numpy as np
+from scipy.linalg import solve
 import sys
+import time
 from properties import *
 from parse_file import *
 
@@ -24,6 +26,7 @@ class RealTime(object):
         propertyarrays:  List containing names of properties stored as arrays.
         truncate:        Method to truncate propertyarrays to a given length
         mmut_restart:    Integer containing how often MMUT restarts
+        au2fs:           Scalar constant to convert au to femtoseconds 
     """
 
     def __init__(self, name):
@@ -55,6 +58,7 @@ class RealTime(object):
         self.energy         = None
         self.frequency      = None
         self.fourier        = None
+        self.au2fs          = 0.0241888425
         # TODO May want to look at a better way of defining which attributes are
         # arrays instead of just hard-coding them in.
         self.propertyarrays = ['electricDipole',
@@ -79,6 +83,112 @@ class RealTime(object):
 
         # Make all arrays consistent length
         clean_data(self)
+
+    def pade_tx(self,dipole_direction='x',spectra='abs',damp_const=5500,
+        num_pts=10000):
+        # num_pts: number of points to sample for pade transformation
+
+        if spectra.lower() == 'abs':  
+            if dipole_direction.lower() == 'x':
+                dipole = self.electricDipole.x
+                kick_strength = self.electricField.x[0]
+            elif dipole_direction.lower() == 'y':
+                dipole = self.electricDipole.y
+                kick_strength = self.electricField.y[0]
+            elif dipole_direction.lower() == 'z':
+                dipole = self.electricDipole.z
+                kick_strength = self.electricField.z[0]
+            else:
+                print "Not a valid direction for the dipole! Try: x,y,z "
+        elif spectra.lower() == 'ecd':
+            if dipole_direction.lower() == 'x':
+                dipole = self.magneticDipole.x
+                kick_strength = self.electricField.x[0]
+            elif dipole_direction.lower() == 'y':
+                dipole = self.magneticDipole.y
+                kick_strength = self.electricField.y[0]
+            elif dipole_direction.lower() == 'z':
+                dipole = self.magneticDipole.z
+                kick_strength = self.electricField.z[0]
+            else:
+                print "Not a valid direction for the dipole! Try: x,y,z "
+        else: 
+            print "Not a valid spectra choice"
+
+        if np.isclose(kick_strength,0.0):
+            print "Kick = 0, you are trying to FFT the wrong file"
+            print "Try to change dipole direction!"
+            sys.exit(0)
+ 
+
+        # skip is integer to skip every n-th value
+        # skip = 1 would not skip any values, but skip = 10 would only
+        # consider every tenth value
+        skip = 1 
+        dipole = dipole - dipole[0]
+        dipole = dipole[::skip]
+        damp = np.exp(-(self.time-self.time[0])/float(damp_const))
+        damp = damp[::skip]
+        dipole = dipole * damp
+
+        timestep = skip*(self.time[2] - self.time[1])
+        M = len(dipole)
+        N = int(np.floor(M / 2))
+
+        if N > num_pts:
+            N = num_pts
+
+        # G and d are (N-1) x (N-1)
+        # d[k] = -dipole[N+k] for k in range(1,N)
+        d = -dipole[N+1:2*N] 
+
+        # Old code, which works with regular Ax=b linear solver. 
+        # G[k,m] = dipole[N - m + k] for m,k in range(1,N)
+        #G = dipole[N + np.arange(1,N)[:,None] - np.arange(1,N)]
+        #b = solve(G,d,check_finite=False)
+
+        # Toeplitz linear solver using Levinson recursion
+        # Should be O(n^2), and seems to work well, but if you get strange
+        # results you may want to switch to regular linear solver which is much
+        # more stable.
+        try:
+            from scipy.linalg import toeplitz, solve_toeplitz
+        except ImportError:
+            print "You'll need SciPy version >= 0.17.0"
+            
+        # Instead, form G = (c,r) as toeplitz
+        #c = dipole[N:2*N-1]
+        #r = np.hstack((dipole[1],dipole[N-1:1:-1]))
+        b = solve_toeplitz((dipole[N:2*N-1],\
+            np.hstack((dipole[1],dipole[N-1:1:-1]))),d,check_finite=False)
+      
+        # Now make b Nx1 where b0 = 1 
+        b = np.hstack((1,b)) 
+
+        # b[m]*dipole[k-m] for k in range(0,N), for m in range(k) 
+        a = np.dot(np.tril(toeplitz(dipole[0:N])),b)
+
+        p = np.poly1d(a)
+        q = np.poly1d(b)
+
+        # If you want energies greater than 2*27.2114 eV, you'll need to change
+        # the default frequency range to something greater.
+        self.frequency = np.arange(0,2,0.0001)
+        W = np.exp(-1j*self.frequency*timestep)
+
+        fw_re = np.real(p(W)/q(W))
+        fw_im = np.imag(p(W)/q(W))
+
+        if np.any(np.isinf(self.frequency)) or np.any(np.isnan(self.frequency)):
+            print "Check your dT: frequency contains NaNs and/or Infs!"
+            sys.exit(0)
+
+        if spectra.lower() == 'abs':
+            self.fourier = \
+                (4.0*self.frequency*np.pi*fw_im)/(3.0*137*kick_strength)
+        elif spectra.lower() == 'ecd':
+            self.fourier = \
+                (17.32*fw_re)/(np.pi*kick_strength)
 
     def fourier_tx(self,dipole_direction='x',spectra='abs',damp_const=150,
                     zero_pad=None,auto=False):
@@ -159,7 +269,7 @@ class RealTime(object):
         fw_im = np.imag(fw)
        
         n = len(fw_re)
-        m = n / 2
+        m = int(n / 2)
         timestep = self.time[2] - self.time[1]
         self.frequency = fftfreq(n,d=timestep)*2.0*np.pi
         if np.any(np.isinf(self.frequency)) or np.any(np.isnan(self.frequency)):
@@ -179,7 +289,6 @@ class RealTime(object):
 
     def test(self):
         self.check_energy()
-        self.check_field()
         self.check_iops()
         pass
 
@@ -238,6 +347,7 @@ class RealTime(object):
             print "Field off:            [OK]"
         elif (self.envelope and int(self.iops['138'][0]) != 0):
             print "Field on:             [OK]"
+            self.check_field()
         else:
             print "Inconsistency in field:"
             print "IOps:                     ", self.iops['138'] 
@@ -249,13 +359,6 @@ class RealTime(object):
             print "Inconsistency in orthonormality"
             print "IOps:                      ", self.iops['136'][1]
             print "logfile showing:           ", self.iops['136'][1]
-           
-       
-           
-            
-           
- 
- 
 
     def expected_field(self,component):
         Time  = self.time
@@ -302,10 +405,10 @@ class RealTime(object):
 
  
 if __name__ == '__main__':
-    x = RealTime('test_y')
-    #import matplotlib.pyplot as plt 
-    #plt.plot(x.time,x.electricDipole.x -x.electricDipole.x[0],label='X')
-    x.test()
+    a = RealTime('test')
+    import matplotlib.pyplot as plt 
+    plt.plot(a.time,a.electricDipole.z)
+    plt.savefig('dipole.pdf')
     #plt.show()
     
             
